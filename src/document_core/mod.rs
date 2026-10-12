@@ -10,6 +10,7 @@ pub mod builders;
 mod commands;
 pub mod converters;
 pub(crate) mod html_table_import;
+pub mod image_utils;
 pub mod queries;
 pub mod table_calc;
 pub mod validation;

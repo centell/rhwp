@@ -5638,6 +5638,151 @@ impl HwpDocument {
         self.measure_width_diagnostic_native(section_idx as usize, para_idx as usize)
             .map_err(|e| e.into())
     }
+
+    /// 문서 전체를 마크다운으로 내보낸다 (문서흐름 경로; 페이지네이션 없음).
+    ///
+    /// `table_mode`: `"auto"` (기본, 병합 셀 시 HTML) | `"markdown"` | `"html"`.
+    /// 알 수 없는 값은 `"auto"`로 처리한다.
+    ///
+    /// 반환값은 JSON 문자열이며 JS 측에서 `JSON.parse`로 파싱한다:
+    /// ```json
+    /// {
+    ///   "markdown": "...",
+    ///   "images": [
+    ///     { "name": "img001.png", "dataBase64": "..." },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    /// 이미지가 없으면 `"images": []`.
+    /// 이미지 해상 실패 시 해당 토큰을 빈 문자열로 치환하고 `images` 배열에서 제외한다.
+    ///
+    /// 마크다운 내 이미지 참조 형식:
+    /// - `[[RHWP_IMAGE:{n}]]`      → `![image {n}](assets/img{n:03}.{ext})`
+    /// - `[[RHWP_IMAGE_HTML:{n}]]` → `<img src="assets/img{n:03}.{ext}" alt="image {n}">`
+    #[wasm_bindgen(js_name = exportMarkdown)]
+    pub fn export_markdown(&self, table_mode: &str) -> Result<String, JsValue> {
+        use crate::document_core::image_utils::normalize_export_image;
+        use crate::document_core::queries::rendering::TableMode;
+        use base64::Engine;
+
+        // table_mode 파싱 (알 수 없는 값은 Auto로 처리)
+        let mode = match table_mode {
+            "markdown" => TableMode::Markdown,
+            "html" => TableMode::Html,
+            _ => TableMode::Auto,
+        };
+
+        // 문서흐름 렌더링 → (markdown, image_refs)
+        let (mut markdown, image_refs) = self
+            .extract_document_markdown_with_images_native(mode)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        // MIME → 확장자 변환
+        let mime_to_ext = |mime: &str| -> &'static str {
+            match mime {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/bmp" => "bmp",
+                "image/webp" => "webp",
+                _ => "bin",
+            }
+        };
+
+        // 이미지 인덱스(1-based) → { name, dataBase64 } 목록
+        let mut images_json: Vec<serde_json::Value> = Vec::new();
+
+        for (img_idx, (sec_idx, para_idx, ctrl_idx, bin_data_id)) in
+            image_refs.iter().enumerate()
+        {
+            let n = img_idx + 1; // 1-based
+
+            // 이미지 바이트 추출: 컨트롤 좌표 우선, 실패 시 bin_data_id 폴백
+            let resolved = match (sec_idx, para_idx, ctrl_idx) {
+                (Some(si), Some(pi), Some(ci)) => {
+                    match (
+                        self.get_control_image_mime_native(*si, *pi, &[], *ci),
+                        self.get_control_image_data_native(*si, *pi, &[], *ci),
+                    ) {
+                        (Ok(m), Ok(d)) => Some((m, d)),
+                        _ => {
+                            // 컨트롤 좌표 실패 → bin_data 폴백
+                            if *bin_data_id != 0 {
+                                match (
+                                    self.get_bin_data_image_mime_native(*bin_data_id),
+                                    self.get_bin_data_image_data_native(*bin_data_id),
+                                ) {
+                                    (Ok(m), Ok(d)) => Some((m, d)),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // 컨트롤 좌표 없음(셀 내 이미지) → bin_data 전용
+                    if *bin_data_id != 0 {
+                        match (
+                            self.get_bin_data_image_mime_native(*bin_data_id),
+                            self.get_bin_data_image_data_native(*bin_data_id),
+                        ) {
+                            (Ok(m), Ok(d)) => Some((m, d)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            match resolved {
+                Some((mime, data)) => {
+                    // BMP → PNG 정규화
+                    let (mime, data) = normalize_export_image(mime, data);
+                    let ext = mime_to_ext(&mime);
+                    let filename = format!("img{:03}.{}", n, ext);
+
+                    // 마크다운 토큰 치환
+                    let token_md = format!("[[RHWP_IMAGE:{}]]", n);
+                    let token_html = format!("[[RHWP_IMAGE_HTML:{}]]", n);
+                    let md_link = format!("![image {}](assets/{})", n, filename);
+                    let html_img = format!(
+                        "<img src=\"assets/{}\" alt=\"image {}\">",
+                        filename, n
+                    );
+                    markdown = markdown.replace(&token_md, &md_link);
+                    markdown = markdown.replace(&token_html, &html_img);
+
+                    // base64 인코딩 후 배열에 추가
+                    let data_b64 =
+                        base64::engine::general_purpose::STANDARD.encode(&data);
+                    images_json.push(serde_json::json!({
+                        "name": filename,
+                        "dataBase64": data_b64,
+                    }));
+                }
+                None => {
+                    // 해상 실패: 토큰을 빈 문자열로 치환
+                    let token_md = format!("[[RHWP_IMAGE:{}]]", n);
+                    let token_html = format!("[[RHWP_IMAGE_HTML:{}]]", n);
+                    markdown = markdown.replace(&token_md, "");
+                    markdown = markdown.replace(&token_html, "");
+                }
+            }
+        }
+
+        // JSON 응답 직렬화 후 JS로 반환
+        // JS: const r = JSON.parse(doc.exportMarkdown('auto'));
+        let result = serde_json::json!({
+            "markdown": markdown,
+            "images": images_json,
+        });
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
 }
 
 pub(crate) mod event;

@@ -1236,7 +1236,17 @@ fn export_text(args: &[String]) {
     );
 }
 
+/// 익스포트용 이미지 정규화.
+///
+/// BMP → PNG 정규화: lib의 공유 구현으로 위임한다.
+/// WASM 경로와 동일한 로직을 사용하기 위해 `document_core::image_utils`로 이동했다.
+fn normalize_export_image(mime: String, data: Vec<u8>) -> (String, Vec<u8>) {
+    rhwp::document_core::image_utils::normalize_export_image(mime, data)
+}
+
 fn export_markdown(args: &[String]) {
+    use rhwp::document_core::queries::rendering::TableMode;
+
     if args.is_empty() {
         eprintln!("오류: HWP 파일 경로를 지정해주세요.");
         eprintln!("사용법: rhwp export-markdown <파일.hwp> [옵션] (rhwp --help 참조)");
@@ -1246,6 +1256,8 @@ fn export_markdown(args: &[String]) {
     let file_path = &args[0];
     let mut output_dir = "output".to_string();
     let mut target_page: Option<u32> = None;
+    // 표 렌더 모드: auto(기본) / markdown / html
+    let mut table_mode = TableMode::Auto;
 
     let mut i = 1;
     while i < args.len() {
@@ -1271,6 +1283,26 @@ fn export_markdown(args: &[String]) {
                     i += 2;
                 } else {
                     eprintln!("오류: --page 뒤에 페이지 번호가 필요합니다.");
+                    return;
+                }
+            }
+            "--table" => {
+                if i + 1 < args.len() {
+                    table_mode = match args[i + 1].as_str() {
+                        "auto" => TableMode::Auto,
+                        "markdown" => TableMode::Markdown,
+                        "html" => TableMode::Html,
+                        other => {
+                            eprintln!(
+                                "오류: --table 값이 올바르지 않습니다 ({}). auto/markdown/html 중 하나를 사용하세요.",
+                                other
+                            );
+                            return;
+                        }
+                    };
+                    i += 2;
+                } else {
+                    eprintln!("오류: --table 뒤에 모드(auto/markdown/html)가 필요합니다.");
                     return;
                 }
             }
@@ -1334,7 +1366,19 @@ fn export_markdown(args: &[String]) {
         .and_then(|s| s.to_str())
         .unwrap_or("page");
 
-    let assets_dir_name = format!("{}_assets", file_stem);
+    // 마크다운 이미지 링크 `![alt](url)` 의 url 은 공백·괄호를 그대로 담을 수 없어,
+    // 파일명에 그런 문자가 있으면 링크가 조기 종료되어 이미지가 렌더되지 않고 텍스트로 노출된다.
+    // 에셋 폴더/이미지 파일명에 한해 링크를 깨뜨리는 문자만 '_' 로 치환한다.
+    // (한글 등은 뷰어가 UTF-8 경로로 처리하므로 유지. .md 파일명 자체는 링크가 아니라 file_stem 유지.)
+    let safe_stem: String = file_stem
+        .chars()
+        .map(|c| match c {
+            ' ' | '\t' | '(' | ')' | '[' | ']' | '<' | '>' | '#' | '?' | '%' => '_',
+            _ => c,
+        })
+        .collect();
+
+    let assets_dir_name = format!("{}_assets", safe_stem);
     let assets_dir_path = output_path.join(&assets_dir_name);
     let mut written_image_count: usize = 0;
 
@@ -1349,142 +1393,250 @@ fn export_markdown(args: &[String]) {
         }
     };
 
-    for page_num in &pages {
-        match doc.extract_page_markdown_with_images_native(*page_num) {
+    // 이미지 1개를 추출·정규화·저장하고 Markdown 링크 문자열을 반환한다.
+    // 페이지 경로/문서흐름 경로가 공통으로 사용한다 (추출/폴백 의미는 동일).
+    // 반환값: Some(링크) = 저장 성공, None = 실패(토큰은 호출자가 빈 문자열로 치환).
+    // `context`는 경고 메시지 식별용 라벨(예: "페이지 1", "문서흐름").
+    let resolve_image = |sec_idx: Option<usize>,
+                         para_idx: Option<usize>,
+                         control_idx: Option<usize>,
+                         bin_data_id: u16,
+                         img_idx: usize,
+                         image_filename: &str,
+                         context: &str|
+     -> Option<String> {
+        let try_control = match (sec_idx, para_idx, control_idx) {
+            (Some(si), Some(pi), Some(ci)) => Some((si, pi, ci)),
+            _ => None,
+        };
+
+        let (mime, image_data) = if let Some((si, pi, ci)) = try_control {
+            match (
+                doc.get_control_image_mime_native(si, pi, &[], ci),
+                doc.get_control_image_data_native(si, pi, &[], ci),
+            ) {
+                (Ok(m), Ok(d)) => (m, d),
+                _ => {
+                    if bin_data_id == 0 {
+                        eprintln!(
+                            "경고: {} 이미지 추출 실패 (s{} p{} c{}), fallback bin_data_id 없음",
+                            context, si, pi, ci
+                        );
+                        return None;
+                    }
+                    let fb_mime = match doc.get_bin_data_image_mime_native(bin_data_id) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!(
+                                "경고: {} 이미지 MIME fallback 실패 (bin={}): {:?}",
+                                context, bin_data_id, e
+                            );
+                            return None;
+                        }
+                    };
+                    let fb_data = match doc.get_bin_data_image_data_native(bin_data_id) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!(
+                                "경고: {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
+                                context, bin_data_id, e
+                            );
+                            return None;
+                        }
+                    };
+                    (fb_mime, fb_data)
+                }
+            }
+        } else {
+            if bin_data_id == 0 {
+                eprintln!(
+                    "경고: {} 이미지 추출 실패 (문서 좌표 없음, bin_data_id=0)",
+                    context
+                );
+                return None;
+            }
+            let fb_mime = match doc.get_bin_data_image_mime_native(bin_data_id) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "경고: {} 이미지 MIME fallback 실패 (bin={}): {:?}",
+                        context, bin_data_id, e
+                    );
+                    return None;
+                }
+            };
+            let fb_data = match doc.get_bin_data_image_data_native(bin_data_id) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!(
+                        "경고: {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
+                        context, bin_data_id, e
+                    );
+                    return None;
+                }
+            };
+            (fb_mime, fb_data)
+        };
+
+        // BMP(.bin) → PNG 정규화: 마크다운 뷰어 렌더 가능 + 용량 축소
+        let (mime, image_data) = normalize_export_image(mime, image_data);
+
+        if !assets_dir_path.exists() {
+            if let Err(e) = fs::create_dir_all(&assets_dir_path) {
+                eprintln!(
+                    "오류: 이미지 출력 폴더 생성 실패 - {}: {}",
+                    assets_dir_path.display(),
+                    e
+                );
+                return None;
+            }
+        }
+
+        let ext = mime_to_ext(&mime);
+        // 호출자가 확장자 미정({EXT})으로 넘긴 파일명을 실제 확장자로 치환한다.
+        let image_filename = image_filename.replace("{EXT}", ext);
+        let image_path = assets_dir_path.join(&image_filename);
+
+        if let Err(e) = fs::write(&image_path, &image_data) {
+            eprintln!("경고: 이미지 저장 실패 - {}: {}", image_path.display(), e);
+            return None;
+        }
+
+        Some(format!(
+            "![image {}]({}/{})",
+            img_idx + 1,
+            assets_dir_name,
+            image_filename
+        ))
+    };
+
+    if target_page.is_some() {
+        // === 페이지 단위 경로 (기존 동작 유지: -p <page> 지정 시) ===
+        for page_num in &pages {
+            match doc.extract_page_markdown_with_images_native(*page_num) {
+                Ok((mut markdown, image_refs)) => {
+                    for (img_idx, (sec_idx, para_idx, control_idx, bin_data_id)) in
+                        image_refs.iter().enumerate()
+                    {
+                        let token = format!("[[RHWP_IMAGE:{}]]", img_idx + 1);
+                        let context = format!("페이지 {}", page_num + 1);
+                        let image_filename = format!(
+                            "{}_p{:03}_img{:03}.{{EXT}}",
+                            safe_stem,
+                            page_num + 1,
+                            img_idx + 1
+                        );
+                        match resolve_image(
+                            *sec_idx,
+                            *para_idx,
+                            *control_idx,
+                            *bin_data_id,
+                            img_idx,
+                            &image_filename,
+                            &context,
+                        ) {
+                            Some(link) => {
+                                markdown = markdown.replace(&token, &link);
+                                written_image_count += 1;
+                            }
+                            None => {
+                                markdown = markdown.replace(&token, "");
+                            }
+                        }
+                    }
+
+                    if !markdown.ends_with('\n') {
+                        markdown.push('\n');
+                    }
+
+                    let md_filename = if page_count == 1 {
+                        format!("{}.md", file_stem)
+                    } else {
+                        format!("{}_{:03}.md", file_stem, page_num + 1)
+                    };
+                    let md_path = output_path.join(&md_filename);
+
+                    match fs::write(&md_path, markdown.as_bytes()) {
+                        Ok(_) => println!("  → {}", md_path.display()),
+                        Err(e) => {
+                            eprintln!("오류: Markdown 저장 실패 - {}: {}", md_path.display(), e)
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("오류: 페이지 {} Markdown 생성 실패 - {:?}", page_num, e);
+                }
+            }
+        }
+
+        if written_image_count > 0 {
+            println!(
+                "Markdown 내보내기 완료: {}개 MD 파일, {}개 이미지 → {}/",
+                pages.len(),
+                written_image_count,
+                output_dir
+            );
+        } else {
+            println!(
+                "Markdown 내보내기 완료: {}개 MD 파일 → {}/",
+                pages.len(),
+                output_dir
+            );
+        }
+    } else {
+        // === 문서흐름 경로 (기본): 논리 IR을 단일 MD로 출력 ===
+        // 페이지네이션을 거치지 않으므로 페이지 경계 절단/쪽 번호 꼬리말이 없다.
+        match doc.extract_document_markdown_with_images_native(table_mode) {
             Ok((mut markdown, image_refs)) => {
                 for (img_idx, (sec_idx, para_idx, control_idx, bin_data_id)) in
                     image_refs.iter().enumerate()
                 {
-                    let token = format!("[[RHWP_IMAGE:{}]]", img_idx + 1);
-
-                    let try_control = match (sec_idx, para_idx, control_idx) {
-                        (Some(si), Some(pi), Some(ci)) => Some((*si, *pi, *ci)),
-                        _ => None,
-                    };
-
-                    let (mime, image_data) = if let Some((si, pi, ci)) = try_control {
-                        match (
-                            doc.get_control_image_mime_native(si, pi, &[], ci),
-                            doc.get_control_image_data_native(si, pi, &[], ci),
-                        ) {
-                            (Ok(m), Ok(d)) => (m, d),
-                            _ => {
-                                if *bin_data_id == 0 {
-                                    eprintln!(
-                                        "경고: 페이지 {} 이미지 추출 실패 (s{} p{} c{}), fallback bin_data_id 없음",
-                                        page_num, si, pi, ci
-                                    );
-                                    markdown = markdown.replace(&token, "");
-                                    continue;
-                                }
-                                let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id)
-                                {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "경고: 페이지 {} 이미지 MIME fallback 실패 (bin={}): {:?}",
-                                            page_num, bin_data_id, e
-                                        );
-                                        markdown = markdown.replace(&token, "");
-                                        continue;
-                                    }
-                                };
-                                let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id)
-                                {
-                                    Ok(d) => d,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "경고: 페이지 {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
-                                            page_num, bin_data_id, e
-                                        );
-                                        markdown = markdown.replace(&token, "");
-                                        continue;
-                                    }
-                                };
-                                (fb_mime, fb_data)
-                            }
+                    let image_filename =
+                        format!("{}_img{:03}.{{EXT}}", safe_stem, img_idx + 1);
+                    // 이미지 경로를 한 번만 추출하고, 마크다운/HTML 두 토큰을 각각 치환한다.
+                    // `[[RHWP_IMAGE:{n}]]`   → `![image n](path)`  (마크다운 표/본문)
+                    // `[[RHWP_IMAGE_HTML:{n}]]` → `<img src="path" alt="image n">` (HTML 표 셀)
+                    match resolve_image(
+                        *sec_idx,
+                        *para_idx,
+                        *control_idx,
+                        *bin_data_id,
+                        img_idx,
+                        &image_filename,
+                        "문서흐름",
+                    ) {
+                        Some(md_link) => {
+                            // md_link 형식: `![image N](assets_dir/filename)`
+                            // HTML <img> 형식을 위해 경로 부분(src)과 alt(N)를 추출한다.
+                            // md_link = "![image N](PATH)" 이므로 src = PATH, alt = "image N".
+                            let html_img = {
+                                // '(' 와 ')' 사이의 경로를 추출
+                                let src = md_link
+                                    .find('(')
+                                    .and_then(|s| md_link.rfind(')').map(|e| &md_link[s + 1..e]))
+                                    .unwrap_or("");
+                                format!("<img src=\"{}\" alt=\"image {}\">", src, img_idx + 1)
+                            };
+                            let token_md = format!("[[RHWP_IMAGE:{}]]", img_idx + 1);
+                            let token_html = format!("[[RHWP_IMAGE_HTML:{}]]", img_idx + 1);
+                            markdown = markdown.replace(&token_md, &md_link);
+                            markdown = markdown.replace(&token_html, &html_img);
+                            written_image_count += 1;
                         }
-                    } else {
-                        if *bin_data_id == 0 {
-                            eprintln!(
-                                "경고: 페이지 {} 이미지 추출 실패 (문서 좌표 없음, bin_data_id=0)",
-                                page_num
-                            );
-                            markdown = markdown.replace(&token, "");
-                            continue;
-                        }
-                        let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                eprintln!(
-                                    "경고: 페이지 {} 이미지 MIME fallback 실패 (bin={}): {:?}",
-                                    page_num, bin_data_id, e
-                                );
-                                markdown = markdown.replace(&token, "");
-                                continue;
-                            }
-                        };
-                        let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                eprintln!(
-                                    "경고: 페이지 {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
-                                    page_num, bin_data_id, e
-                                );
-                                markdown = markdown.replace(&token, "");
-                                continue;
-                            }
-                        };
-                        (fb_mime, fb_data)
-                    };
-
-                    if !assets_dir_path.exists() {
-                        if let Err(e) = fs::create_dir_all(&assets_dir_path) {
-                            eprintln!(
-                                "오류: 이미지 출력 폴더 생성 실패 - {}: {}",
-                                assets_dir_path.display(),
-                                e
-                            );
-                            markdown = markdown.replace(&token, "");
-                            continue;
+                        None => {
+                            let token_md = format!("[[RHWP_IMAGE:{}]]", img_idx + 1);
+                            let token_html = format!("[[RHWP_IMAGE_HTML:{}]]", img_idx + 1);
+                            markdown = markdown.replace(&token_md, "");
+                            markdown = markdown.replace(&token_html, "");
                         }
                     }
-
-                    let ext = mime_to_ext(&mime);
-                    let image_filename = format!(
-                        "{}_p{:03}_img{:03}.{}",
-                        file_stem,
-                        page_num + 1,
-                        img_idx + 1,
-                        ext
-                    );
-                    let image_path = assets_dir_path.join(&image_filename);
-
-                    if let Err(e) = fs::write(&image_path, &image_data) {
-                        eprintln!("경고: 이미지 저장 실패 - {}: {}", image_path.display(), e);
-                        markdown = markdown.replace(&token, "");
-                        continue;
-                    }
-
-                    let image_link = format!(
-                        "![image {}]({}/{})",
-                        img_idx + 1,
-                        assets_dir_name,
-                        image_filename
-                    );
-                    markdown = markdown.replace(&token, &image_link);
-                    written_image_count += 1;
                 }
 
                 if !markdown.ends_with('\n') {
                     markdown.push('\n');
                 }
 
-                let md_filename = if page_count == 1 {
-                    format!("{}.md", file_stem)
-                } else {
-                    format!("{}_{:03}.md", file_stem, page_num + 1)
-                };
+                let md_filename = format!("{}.md", file_stem);
                 let md_path = output_path.join(&md_filename);
 
                 match fs::write(&md_path, markdown.as_bytes()) {
@@ -1493,24 +1645,21 @@ fn export_markdown(args: &[String]) {
                 }
             }
             Err(e) => {
-                eprintln!("오류: 페이지 {} Markdown 생성 실패 - {:?}", page_num, e);
+                eprintln!("오류: 문서흐름 Markdown 생성 실패 - {:?}", e);
             }
         }
-    }
 
-    if written_image_count > 0 {
-        println!(
-            "Markdown 내보내기 완료: {}개 MD 파일, {}개 이미지 → {}/",
-            pages.len(),
-            written_image_count,
-            output_dir
-        );
-    } else {
-        println!(
-            "Markdown 내보내기 완료: {}개 MD 파일 → {}/",
-            pages.len(),
-            output_dir
-        );
+        if written_image_count > 0 {
+            println!(
+                "Markdown 내보내기 완료: 1개 MD 파일(문서흐름), {}개 이미지 → {}/",
+                written_image_count, output_dir
+            );
+        } else {
+            println!(
+                "Markdown 내보내기 완료: 1개 MD 파일(문서흐름) → {}/",
+                output_dir
+            );
+        }
     }
 }
 

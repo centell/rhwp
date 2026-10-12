@@ -232,6 +232,296 @@ fn apply_page_number_layouts_for_section(result: &mut PaginationResult, section:
     }
 }
 
+/// 표 셀 텍스트를 Markdown 셀로 안전하게 이스케이프한다.
+///
+/// `|`는 표 구분자와 충돌하므로 escape하고, 셀 내 개행은 공백으로 평탄화한다.
+fn markdown_escape_cell(s: &str) -> String {
+    s.replace('|', "\\|")
+        .replace('\r', "")
+        .replace('\n', " ")
+        .trim()
+        .to_string()
+}
+
+/// 표 셀의 모든 문단 텍스트를 합쳐 하나의 Markdown 셀 문자열로 만든다.
+fn table_cell_text(cell: &crate::model::table::Cell) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for para in &cell.paragraphs {
+        let txt = para.text.trim();
+        if !txt.is_empty() {
+            parts.push(markdown_escape_cell(txt));
+        }
+    }
+    parts.join(" <br> ")
+}
+
+/// `Table` 모델을 Markdown pipe table 문자열로 변환한다.
+///
+/// 페이지 단위/문서흐름 단위 Markdown 추출에서 공통으로 사용한다.
+fn table_to_markdown(table: &crate::model::table::Table) -> String {
+    let rows = table.row_count as usize;
+    let cols = table.col_count as usize;
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+
+    let mut grid = vec![vec![String::new(); cols]; rows];
+
+    for cell in &table.cells {
+        let r = cell.row as usize;
+        let c = cell.col as usize;
+        if r >= rows || c >= cols {
+            continue;
+        }
+        grid[r][c] = table_cell_text(cell);
+    }
+
+    let make_row = |cells: &[String]| -> String { format!("| {} |", cells.join(" | ")) };
+
+    let header = make_row(&grid[0]);
+    let separator = format!(
+        "| {} |",
+        std::iter::repeat("---")
+            .take(cols)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+
+    let mut lines = vec![header, separator];
+    for row in grid.iter().skip(1) {
+        lines.push(make_row(row));
+    }
+    lines.join("\n")
+}
+
+/// 문서흐름 표 렌더링 모드.
+///
+/// - `Auto`: 병합 셀(colspan/rowspan)이 하나라도 있으면 HTML, 없으면 마크다운.
+/// - `Markdown`: 전부 마크다운 파이프표 (기존 동작).
+/// - `Html`: 전부 HTML `<table>`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TableMode {
+    Auto,
+    Markdown,
+    Html,
+}
+
+/// 표에 병합 셀(colspan>1 또는 rowspan>1)이 하나라도 있으면 true.
+fn table_has_merge(table: &crate::model::table::Table) -> bool {
+    table.cells.iter().any(|c| c.col_span > 1 || c.row_span > 1)
+}
+
+/// 문자열을 HTML 텍스트로 안전하게 이스케이프한다 (`&`, `<`, `>`).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// 문서흐름 전용 표 렌더러: 텍스트 + 셀 내 그림 토큰을 함께 출력한다.
+///
+/// `table_to_markdown`(텍스트 전용)의 형제 함수이며, 셀 내 `Control::Picture`를
+/// 발견할 때마다 `[[RHWP_IMAGE:{n}]]` 토큰을 셀 내용에 삽입하고
+/// 호출자의 `images` 벡터와 `image_counter`를 갱신한다.
+///
+/// - `image_counter`: 문서 전체에서 공유하는 1-based 이미지 카운터 (`images.len() + 1`과 일치).
+/// - `images`: 호출자의 ref 벡터. 셀 내 그림은 `(None, None, None, bin_data_id)`로 추가한다
+///   (좌표가 없으므로 호출자는 `bin_data_id` fallback 경로로 바이트를 추출한다).
+/// - 페이지 경로에서 사용하는 `table_to_markdown`은 이 함수로 교체하지 않는다.
+fn table_to_markdown_flow(
+    table: &crate::model::table::Table,
+    image_counter: &mut usize,
+    images: &mut Vec<(Option<usize>, Option<usize>, Option<usize>, u16)>,
+) -> String {
+    use crate::model::control::Control;
+
+    let rows = table.row_count as usize;
+    let cols = table.col_count as usize;
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+
+    let mut grid = vec![vec![String::new(); cols]; rows];
+
+    for cell in &table.cells {
+        let r = cell.row as usize;
+        let c = cell.col as usize;
+        if r >= rows || c >= cols {
+            continue;
+        }
+
+        // 셀 내 텍스트 + 그림 토큰을 순서대로 수집한다.
+        let mut parts: Vec<String> = Vec::new();
+
+        for para in &cell.paragraphs {
+            // 1) 문단 텍스트
+            let txt = para.text.trim();
+            if !txt.is_empty() {
+                parts.push(markdown_escape_cell(txt));
+            }
+            // 2) 셀 내 그림 컨트롤 → 토큰 삽입 + ref 등록
+            for ctrl in &para.controls {
+                if let Control::Picture(pic) = ctrl {
+                    *image_counter += 1;
+                    // 토큰은 `|`와 `\n`을 포함하지 않으므로 셀 내 삽입 안전
+                    parts.push(format!("[[RHWP_IMAGE:{}]]", image_counter));
+                    // 좌표 없음 → 호출자가 bin_data_id fallback으로 추출
+                    images.push((None, None, None, pic.image_attr.bin_data_id));
+                }
+            }
+        }
+
+        grid[r][c] = if parts.is_empty() {
+            String::new()
+        } else {
+            parts.join(" ")
+        };
+    }
+
+    let make_row = |cells: &[String]| -> String { format!("| {} |", cells.join(" | ")) };
+
+    let header = make_row(&grid[0]);
+    let separator = format!(
+        "| {} |",
+        std::iter::repeat("---")
+            .take(cols)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+
+    let mut lines = vec![header, separator];
+    for row in grid.iter().skip(1) {
+        lines.push(make_row(row));
+    }
+    lines.join("\n")
+}
+
+/// 문서흐름 전용 HTML 표 렌더러: 병합 셀(colspan/rowspan)을 실제 HTML 속성으로 출력한다.
+///
+/// 셀 내용은 HTML 이스케이프(`&`,`<`,`>`)하고, 셀 내 개행은 `<br>`로 변환한다.
+/// 셀 내 `Control::Picture`는 `[[RHWP_IMAGE_HTML:{n}]]` 토큰으로 삽입하고
+/// (나중에 main.rs에서 `<img src="..." alt="...">` 로 교체),
+/// `image_counter`와 `images`는 `table_to_markdown_flow`와 동일하게 공유한다.
+///
+/// **앵커 셀 판정**: `cell.row == r && cell.col == c` 인 셀만 `<td>`를 출력하고,
+/// span 아래 덮인 좌표는 건너뛴다.
+fn table_to_html_flow(
+    table: &crate::model::table::Table,
+    image_counter: &mut usize,
+    images: &mut Vec<(Option<usize>, Option<usize>, Option<usize>, u16)>,
+) -> String {
+    use crate::model::control::Control;
+
+    let rows = table.row_count as usize;
+    let cols = table.col_count as usize;
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+
+    // 앵커 셀 인덱스 맵: anchor_map[r * cols + c] = Some(cell_vec_index).
+    // 병합에 덮인 칸은 None (건너뜀).
+    let mut anchor_map: Vec<Option<usize>> = vec![None; rows * cols];
+    for (cell_idx, cell) in table.cells.iter().enumerate() {
+        let r = cell.row as usize;
+        let c = cell.col as usize;
+        if r >= rows || c >= cols {
+            continue;
+        }
+        // 앵커 셀 자신만 등록한다. span에 덮인 칸은 덮어쓰지 않는다.
+        // (table.rs 문서에서 cells[]는 앵커 셀만 나열하므로 각 칸은 최대 1개의 앵커)
+        anchor_map[r * cols + c] = Some(cell_idx);
+    }
+
+    // span에 덮인 좌표 집합: 앵커의 (row,col) + colspan/rowspan 으로 계산.
+    // 덮인 칸은 <td> 출력을 건너뛴다.
+    let mut covered: Vec<bool> = vec![false; rows * cols];
+    for cell in &table.cells {
+        let r0 = cell.row as usize;
+        let c0 = cell.col as usize;
+        let rs = cell.row_span.max(1) as usize;
+        let cs = cell.col_span.max(1) as usize;
+        // span 영역의 앵커 자신을 제외한 나머지 칸을 덮인 것으로 표시.
+        for dr in 0..rs {
+            for dc in 0..cs {
+                if dr == 0 && dc == 0 {
+                    continue; // 앵커 자신은 건너뜀 않음
+                }
+                let rr = r0 + dr;
+                let cc = c0 + dc;
+                if rr < rows && cc < cols {
+                    covered[rr * cols + cc] = true;
+                }
+            }
+        }
+    }
+
+    let mut out = String::from("<table>\n");
+    for r in 0..rows {
+        out.push_str("<tr>\n");
+        for c in 0..cols {
+            // 덮인 칸은 출력하지 않는다.
+            if covered[r * cols + c] {
+                continue;
+            }
+            // 앵커 셀 데이터를 가져온다.
+            let cell = match anchor_map[r * cols + c] {
+                Some(idx) => &table.cells[idx],
+                None => {
+                    // 앵커가 없는 빈 칸 (좌표에 해당하는 셀이 없는 구조적 공백)
+                    out.push_str("<td></td>\n");
+                    continue;
+                }
+            };
+
+            // colspan/rowspan 속성 (1이면 생략).
+            let cs = cell.col_span.max(1);
+            let rs = cell.row_span.max(1);
+            let span_attr = match (cs > 1, rs > 1) {
+                (true, true) => format!(" colspan=\"{}\" rowspan=\"{}\"", cs, rs),
+                (true, false) => format!(" colspan=\"{}\"", cs),
+                (false, true) => format!(" rowspan=\"{}\"", rs),
+                (false, false) => String::new(),
+            };
+
+            // 셀 내용: 텍스트(HTML 이스케이프) + 그림 토큰.
+            let mut parts: Vec<String> = Vec::new();
+            for para in &cell.paragraphs {
+                // HWP5에서 para.text는 제어문자를 포함하지 않으므로 그대로 이스케이프.
+                // HWP3 U+FFFC 플레이스홀더는 제거한다.
+                let txt: String = para
+                    .text
+                    .chars()
+                    .filter(|&ch| ch != '\u{FFFC}' && ch != '\r')
+                    .collect();
+                let txt = txt.trim();
+                if !txt.is_empty() {
+                    // 셀 내 줄바꿈은 <br>로 변환.
+                    let escaped = html_escape(txt).replace('\n', "<br>");
+                    parts.push(escaped);
+                }
+                for ctrl in &para.controls {
+                    if let Control::Picture(pic) = ctrl {
+                        *image_counter += 1;
+                        // HTML 표 내: [[RHWP_IMAGE_HTML:{n}]] 토큰 → <img> 교체는 main.rs
+                        parts.push(format!("[[RHWP_IMAGE_HTML:{}]]", image_counter));
+                        images.push((None, None, None, pic.image_attr.bin_data_id));
+                    }
+                }
+            }
+
+            let content = if parts.is_empty() {
+                String::new()
+            } else {
+                parts.join(" ")
+            };
+            out.push_str(&format!("<td{}>{}</td>\n", span_attr, content));
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</table>");
+    out
+}
+
 impl DocumentCore {
     /// 페이지 렌더 트리를 생성하여 반환한다 (native bridge / 외부 렌더러용).
     pub fn build_page_render_tree(&self, page_num: u32) -> Result<PageRenderTree, HwpError> {
@@ -3375,61 +3665,6 @@ impl DocumentCore {
             }
         }
 
-        fn markdown_escape_cell(s: &str) -> String {
-            s.replace('|', "\\|")
-                .replace('\r', "")
-                .replace('\n', " ")
-                .trim()
-                .to_string()
-        }
-
-        fn table_cell_text(cell: &crate::model::table::Cell) -> String {
-            let mut parts: Vec<String> = Vec::new();
-            for para in &cell.paragraphs {
-                let txt = para.text.trim();
-                if !txt.is_empty() {
-                    parts.push(markdown_escape_cell(txt));
-                }
-            }
-            parts.join(" <br> ")
-        }
-
-        fn table_to_markdown(table: &crate::model::table::Table) -> String {
-            let rows = table.row_count as usize;
-            let cols = table.col_count as usize;
-            if rows == 0 || cols == 0 {
-                return String::new();
-            }
-
-            let mut grid = vec![vec![String::new(); cols]; rows];
-
-            for cell in &table.cells {
-                let r = cell.row as usize;
-                let c = cell.col as usize;
-                if r >= rows || c >= cols {
-                    continue;
-                }
-                grid[r][c] = table_cell_text(cell);
-            }
-
-            let make_row = |cells: &[String]| -> String { format!("| {} |", cells.join(" | ")) };
-
-            let header = make_row(&grid[0]);
-            let separator = format!(
-                "| {} |",
-                std::iter::repeat("---")
-                    .take(cols)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-
-            let mut lines = vec![header, separator];
-            for row in grid.iter().skip(1) {
-                lines.push(make_row(row));
-            }
-            lines.join("\n")
-        }
-
         fn lookup_table<'a>(
             doc: &'a crate::model::document::Document,
             sec_idx: usize,
@@ -3554,6 +3789,115 @@ impl DocumentCore {
     pub fn extract_page_markdown_native(&self, page_num: u32) -> Result<String, HwpError> {
         self.extract_page_markdown_with_images_native(page_num)
             .map(|(md, _)| md)
+    }
+
+    /// 문서 전체를 논리 흐름(IR) 순서대로 단일 Markdown으로 추출한다 (이미지 토큰 포함).
+    ///
+    /// 페이지네이션(`build_page_tree`)을 거치지 않으므로 페이지 경계에서 문단/표가
+    /// 잘리지 않고, 쪽 번호 꼬리말(`-1-` 등) 같은 페이지 산출물도 섞이지 않는다.
+    ///
+    /// - 섹션 → 문단 순서로 순회하며, 각 문단의 `text`를 한 블록으로 출력한다.
+    /// - 표 컨트롤은 `table_to_markdown_flow`로 통째로 변환한다.
+    ///   셀 내 `Control::Picture`도 같은 이미지 카운터로 토큰화하여 셀 내용에 삽입한다.
+    /// - 최상위 그림 컨트롤은 `[[RHWP_IMAGE:n]]` 토큰으로 출력하고, 같은 순서로
+    ///   `(Some(sec_idx), Some(para_idx), Some(control_idx), bin_data_id)`를 반환한다.
+    /// - 셀 내 그림은 `(None, None, None, bin_data_id)`로 반환한다.
+    ///   (호출자는 좌표가 없으면 `bin_data_id` fallback 경로로 바이트를 추출한다)
+    /// - 블록은 빈 줄로 구분하여 잘 형성된 Markdown을 보장한다.
+    pub fn extract_document_markdown_with_images_native(
+        &self,
+        table_mode: TableMode,
+    ) -> Result<
+        (
+            String,
+            Vec<(Option<usize>, Option<usize>, Option<usize>, u16)>,
+        ),
+        HwpError,
+    > {
+        let mut out = String::new();
+        let mut images: Vec<(Option<usize>, Option<usize>, Option<usize>, u16)> = Vec::new();
+        // 문서 전체에서 공유하는 1-based 이미지 카운터.
+        // `table_to_markdown_flow`/`table_to_html_flow`가 직접 증가시키므로 mutable ref로 전달한다.
+        let mut image_counter: usize = 0;
+
+        // 블록 사이에 빈 줄을 보장한다.
+        let push_block_sep = |out: &mut String| {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                if out.ends_with('\n') {
+                    out.push('\n');
+                } else {
+                    out.push_str("\n\n");
+                }
+            }
+        };
+
+        for (sec_idx, section) in self.document.sections.iter().enumerate() {
+            for (para_idx, para) in section.paragraphs.iter().enumerate() {
+                // 1) 문단 텍스트 블록.
+                //    HWP5는 인라인 컨트롤(표/그림 등)을 text에 placeholder로 남기지 않지만,
+                //    HWP3는 개체 자리에 U+FFFC를 넣으므로 제거한다. 내부 개행/CR은 공백으로
+                //    평탄화하여 Markdown 블록이 쪼개지지 않도록 한다.
+                let cleaned: String = para
+                    .text
+                    .chars()
+                    .filter(|&c| c != '\u{FFFC}' && c != '\r')
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .collect();
+                let trimmed = cleaned.trim();
+                if !trimmed.is_empty() {
+                    push_block_sep(&mut out);
+                    out.push_str(trimmed);
+                    out.push('\n');
+                }
+
+                // 2) 문단 내 컨트롤: 표/그림을 reading order대로 처리.
+                for (ctrl_idx, ctrl) in para.controls.iter().enumerate() {
+                    match ctrl {
+                        Control::Table(table) => {
+                            // table_mode에 따라 마크다운 파이프표 또는 HTML 표로 렌더한다.
+                            // Auto 모드: 병합 셀이 있으면 HTML, 없으면 마크다운.
+                            let use_html = match table_mode {
+                                TableMode::Html => true,
+                                TableMode::Markdown => false,
+                                TableMode::Auto => table_has_merge(table.as_ref()),
+                            };
+                            let rendered = if use_html {
+                                table_to_html_flow(
+                                    table.as_ref(),
+                                    &mut image_counter,
+                                    &mut images,
+                                )
+                            } else {
+                                table_to_markdown_flow(
+                                    table.as_ref(),
+                                    &mut image_counter,
+                                    &mut images,
+                                )
+                            };
+                            if !rendered.is_empty() {
+                                push_block_sep(&mut out);
+                                out.push_str(&rendered);
+                                out.push_str("\n\n");
+                            }
+                        }
+                        Control::Picture(pic) => {
+                            push_block_sep(&mut out);
+                            image_counter += 1;
+                            out.push_str(&format!("[[RHWP_IMAGE:{}]]\n\n", image_counter));
+                            images.push((
+                                Some(sec_idx),
+                                Some(para_idx),
+                                Some(ctrl_idx),
+                                pic.image_attr.bin_data_id,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok((out.trim_end().to_string(), images))
     }
 
     // =====================================================================
